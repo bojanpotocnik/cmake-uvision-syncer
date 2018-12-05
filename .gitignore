@@ -1,0 +1,9 @@
+# PyCharm
+.idea/deployment.xml
+.idea/misc.xml
+.idea/workspace.xml
+.idea/libraries/
+.idea/cmake-uvision-syncer.iml
+
+# Python
+__pycache__
