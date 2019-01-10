@@ -1,7 +1,8 @@
+import enum
 import os
 import warnings
 from dataclasses import dataclass
-from typing import List
+from typing import List, Any, Optional
 
 from lxml import etree
 
@@ -12,6 +13,7 @@ fp_proj = r"<machine local, not commited>\twi_scanner_pca10056.uvprojx"
 
 UnknownInt = int
 UnknownBool = bool
+TODOType = Any
 
 
 # region XML data structures for Project File
@@ -29,6 +31,40 @@ class Target:
 
     name: str
     toolset: Toolset
+
+
+@dataclass
+class RTE:
+    @dataclass
+    class TargetInfo:
+        @enum.unique
+        class VersionMatchMode(enum.Enum):
+            FIXED = "fixed"
+
+        name: str
+        version_match_mode: Optional[VersionMatchMode]
+
+    @dataclass
+    class Package:
+        name: str
+        url: str
+        vendor: str
+        version: str
+        target_infos: List['RTE.TargetInfo']
+
+    @dataclass
+    class Component:
+        class_: str
+        group: str
+        vendor: str
+        version: str
+        condition: str
+        package: 'RTE.Package'
+        target_infos: List['RTE.TargetInfo']
+
+    packages: List[Package]
+    components: List[Component]
+    files: TODOType
 
 
 # endregion XML data structures for Project File
@@ -72,7 +108,10 @@ class Group:
 
 # region XML parsing helper functions
 
-def text(element: etree.ElementBase, name: str) -> str:
+def text(element: etree.ElementBase, name: str, is_attribute: bool = False) -> str:
+    if is_attribute:
+        return element.attrib[name]
+
     value = element.xpath(name)
     if len(value) != 1:
         raise ValueError(f"Only one '{name}' tag per tree is supported, {len(value)}  found")
@@ -122,6 +161,8 @@ class UVisionProject:
             xopt: etree._Element = etree.parse(f).getroot()
 
         # region Project File
+        if xproj.tag != "Project":
+            raise ValueError("Invalid uVision Project File XML file")
 
         target = xproj.xpath("/Project/Targets/Target")
         if len(target) > 1:
@@ -136,6 +177,69 @@ class UVisionProject:
                 name=text(target, "ToolsetName")
             )
         )
+
+        # noinspection PyCallByClass
+        rte = RTE(
+            packages=[
+                RTE.Package(
+                    name=text(package, "name", True),
+                    url=text(package, "url", True),
+                    vendor=text(package, "vendor", True),
+                    version=text(package, "version", True),
+                    target_infos=[
+                        RTE.TargetInfo(
+                            name=text(ti, "name", True),
+                            version_match_mode=RTE.TargetInfo.VersionMatchMode(text(ti, "versionMatchMode", True))
+                        ) for ti in package.xpath("targetInfos/targetInfo")
+                    ]
+                ) for package in xproj.xpath("RTE/packages/package")
+            ],
+            components=[
+                RTE.Component(
+                    class_=text(component, "Cclass", True),
+                    group=text(component, "Cgroup", True),
+                    vendor=text(component, "Cvendor", True),
+                    version=text(component, "Cversion", True),
+                    condition=text(component, "condition", True),
+                    package=[
+                        # There is always only one package, but using list comprehension [][0] is clean and
+                        # effective ways of creating an inline local variable.
+                        # This new instance of package will be replaced below with reference to an actual matching
+                        # instance of the package from rte.packages.
+                        RTE.Package(
+                            name=text(package, "name", True),
+                            url=text(package, "url", True),
+                            vendor=text(package, "vendor", True),
+                            version=text(package, "version", True),
+                            target_infos=None
+                        ) for package in component.xpath("package")
+                    ][0],
+                    target_infos=[
+                        RTE.TargetInfo(
+                            name=text(ti, "name", True),
+                            version_match_mode=RTE.TargetInfo.VersionMatchMode(text(ti, "versionMatchMode", True))
+                        ) for ti in component.xpath("targetInfos/targetInfo")
+                    ]
+                ) for component in xproj.xpath("RTE/components/component")
+            ],
+            files=None
+        )
+        for component in rte.components:
+            cp = component.package
+            component.package = None
+            cp.target_infos = None
+            for package in rte.packages:
+                # Temporally remove target_infos to enable usage of equality operator.
+                pti = package.target_infos
+                package.target_infos = None
+                if cp == package:
+                    component.package = package
+                    package.target_infos = pti
+                    break
+                package.target_infos = pti
+
+        print()
+
         # endregion Project File
 
         # region Project Options
