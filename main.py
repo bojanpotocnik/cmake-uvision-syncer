@@ -11,8 +11,9 @@ from lxml import etree
 
 __author__ = "Bojan Potočnik"
 
-fp_cmake = r"<machine local, not commited>\CMakeLists.txt"
-fp_proj = r"<machine local, not commited>\twi_scanner_pca10056.uvprojx"
+fp_cmake = r"G:\Git\Dia-Vit\fw-spectrometer-logger\CMakeLists.txt"
+# fp_proj = r"D:\SDK\nRF5_SDK_15.2.0_9412b96\examples\peripheral\twi_scanner\pca10056\blank\arm5_no_packs\twi_scanner_pca10056.uvoptx"
+fp_proj = r"G:\Git\Dia-Vit\fw-spectrometer-logger\spectral_data_logger.uvprojx"
 
 UnknownInt = int
 UnknownBool = bool
@@ -574,60 +575,195 @@ class CMake:
         CPP = "C++"
 
     @dataclass
-    class LanguageConfig:
-        include_paths: List[str] = field(default_factory=list)
-        defines: List[str] = field(default_factory=list)
-        undefines: List[str] = field(default_factory=list)
-        source_file_paths: List[str] = field(default_factory=list)
+    class String:
+        value: str
+        """The actual string value."""
+        languages: Set['CMake.Language']
+        """Set of all build configs in which this value is present."""
+        common: bool = False
+        comment: Optional[str] = None
+        """Comment which will be added to the line before"""
 
-    def __init__(self, languages: Iterable[Language] = (Language.ASM, Language.C)) -> None:
-        self.language_configs: Dict['CMake.Language', 'CMake.LanguageConfig'] = {
-            language: self.LanguageConfig() for language in languages
-        }
-        self.common = self.LanguageConfig()
+        def __eq__(self, o: 'CMake.String') -> bool:
+            if isinstance(o, type(self)):
+                return self.value == o.value
+            elif isinstance(o, str):
+                return self.value == o
+            return NotImplemented
 
-    def _check_common(self) -> None:
-        """Move properties common to all languages to the separate config."""
-        # Start with any config as this is union of the properties of all
-        lc_others = list(self.language_configs.values())
-        lc_one, lc_others = lc_others[0], lc_others[1:]
+    def __init__(self) -> None:
+        self.include_paths: List[CMake.String] = []
+        self.defines: List[CMake.String] = []
+        self.undefines: List[CMake.String] = []
+        self.source_file_paths: List[CMake.String] = []
 
-        for ip in lc_one.include_paths:
-            if all(ip in lc.include_paths for lc in lc_others):
-                # TODO
-                pass
+    @classmethod
+    def _get(cls, lst: List[String], obj: str) -> String:
+        """Get existing object from the list or append a new one to the end."""
+        try:
+            # noinspection PyTypeChecker
+            itm = lst[lst.index(obj)]
+        except ValueError:
+            # noinspection PyCallByClass
+            itm = cls.String(obj, set())
+            lst.append(itm)
+        return itm
+
+    @classmethod
+    def _add_values(cls, where: List[String], values: Union[str, Iterable[str]],
+                    languages: Union[Language, Collection[Language]], comment: Optional[str] = None) -> None:
+        if isinstance(languages, CMake.Language):
+            languages = [languages]
+
+        for val in values:
+            obj = cls._get(where, val)
+            if comment is not None:
+                # Add comment to the first value only
+                obj.comment = comment
+                comment = None
+            obj.languages.update(languages)
+
+    def add_include_paths(self, paths: Union[str, Iterable[str]], languages: Union[Language, Collection[Language]],
+                          comment: str = None) -> None:
+        if isinstance(paths, (str, Path)):
+            paths = [paths]
+        self._add_values(self.include_paths, paths, languages, comment)
+
+    def add_defines(self, defines: Union[str, Iterable[str]], languages: Union[Language, Collection[Language]],
+                    comment: str = None) -> None:
+        self._add_values(self.defines, defines, languages, comment)
+
+    def add_undefines(self, undefines: Union[str, Iterable[str]], languages: Union[Language, Collection[Language]],
+                      comment: str = None) -> None:
+        self._add_values(self.undefines, undefines, languages, comment)
+
+    def add_source_files(self, paths: Union[str, Iterable[str]], languages: Union[Language, Collection[Language]],
+                         comment: str = None) -> None:
+        if isinstance(paths, (str, Path)):
+            paths = [paths]
+        self._add_values(self.source_file_paths, paths, languages, comment)
+
+    def _check_common(self) -> Set[Language]:
+        """
+        Check which properties are common to all language configurations.
+
+        :return: Set of all used languages (languages with at least one property)
+        """
+        all_props = (self.include_paths, self.defines, self.undefines, self.source_file_paths)
+
+        # Get all of the defined languages used
+        languages = {lang
+                     for props in all_props
+                     for prop in props
+                     for lang in prop.languages}
+
+        for props in all_props:
+            for prop in props:
+                prop.common = (prop.languages == languages)
+
+        return languages
 
     def __str__(self) -> str:
-        self._check_common()
+        languages = sorted(self._check_common(), key=operator.attrgetter('value'))
 
-        lc_str = []
-        for lang, lc in self.language_configs.items():
-            s = (f"# {lang.value} include directories\n"
-                 f"set(INCLUDE_DIRS_{lang.name}"
-                 )
-            for ip in lc.include_paths:
-                s += f"\n\t{ip}"
-            s += "\n)"
-            lc_str.append(s)
+        ret_str = []
 
-        return "\n\n".join(lc_str)
+        # Set of the build properties
+        prop_sets: List[Tuple[str, str, List[CMake.String]]] = [
+            ("include directories", "INCLUDE_DIRS", self.include_paths),
+            ("definitions", "DEFINES", self.defines),
+            ("un-defines", "UNDEFINES", self.undefines),
+            ("source files", "SOURCES", self.source_file_paths),
+        ]
+
+        # Set of the language configs per build property
+        sub_prop_sets: List[Tuple[str, str, Callable[[CMake.String], bool]]] = [
+            ("Common", "COMMON", lambda prop: prop.common),
+            *((lang.value + " specific", lang.name,
+               lambda prop, lang_=lang: (not prop.common) and (lang_ in prop.languages))
+              for lang in languages)
+        ]
+
+        for section_comment, section_var_prefix, section_props in prop_sets:
+            ss_str = []
+            for comment, var_suffix, filter_fun in sub_prop_sets:
+                s = (f"# {comment} {section_comment}\n"
+                     f"set({section_var_prefix}_{var_suffix}")
+                for ip in filter(filter_fun, section_props):
+                    if ip.comment is not None:
+                        s += f"\n\t# {ip.comment}"
+                    s += f"\n\t{ip.value}"
+                s += "\n)"
+                ss_str.append(s)
+            ret_str.append("\n\n".join(ss_str))
+
+        # for lang, lc in self.language_configs.items():
+        #     s = (f"# {lang.value} include directories\n"
+        #          f"set(INCLUDE_DIRS_{lang.name}"
+        #          )
+        #     for ip in lc.include_paths:
+        #         s += f"\n\t{ip}"
+        #     s += "\n)"
+        #     lc_str.append(s)
+
+        return "\n\n\n".join(ret_str)
 
 
 def main() -> None:
     uvpf = UVisionProject.new(fp_proj)
 
-    print("ASM Includes:")
-    print("".join(f"\t{path}\n" for path in uvpf.targets[0].build.asm.include_paths))
-
-    print("C Includes:")
-    print("".join(f"\t{path}\n" for path in uvpf.targets[0].build.c.include_paths))
+    # print("ASM Includes:")
+    # print("".join(f"\t{path}\n" for path in uvpf.targets[0].build.asm.include_paths))
+    #
+    # print("C Includes:")
+    # print("".join(f"\t{path}\n" for path in uvpf.targets[0].build.c.include_paths))
 
     print()
 
+    # for group in uvpf.targets[0].groups:
+    #     for file in group.files:
+    #         if "ads1x1x" not in file.name:
+    #             continue
+    #         print(file)
+    #
+    # for group in uvpf.groups:
+    #     for file in group.files:
+    #         if "ads1x1x" not in file.filename:
+    #             continue
+    #         print(file)
+
     cmake = CMake()
 
-    for path in uvpf.targets[0].build.c.include_paths:
-        cmake.language_configs[cmake.Language.C].include_paths.append(path)
+    cmake.add_include_paths(uvpf.targets[0].build.asm.include_paths, CMake.Language.ASM)
+    cmake.add_defines(uvpf.targets[0].build.asm.defines, CMake.Language.ASM)
+    cmake.add_undefines(uvpf.targets[0].build.asm.undefines, CMake.Language.ASM)
+    # cmake.add_undefines(uvpf.targets[0].groups, CMake.Language.ASM)
+
+    cmake.add_include_paths(uvpf.targets[0].build.c.include_paths, CMake.Language.C)
+    cmake.add_defines(uvpf.targets[0].build.c.defines, CMake.Language.C)
+    cmake.add_undefines(uvpf.targets[0].build.c.undefines, CMake.Language.C)
+
+    for group in uvpf.groups:
+        comment = group.name
+        # TODO: Add one comment for every file type as they are in the separate sections
+        for file in group.files:
+            if file.type == FileType.ASM_SOURCE:
+                lang = CMake.Language.ASM
+            elif file.type == FileType.C_SOURCE:
+                lang = CMake.Language.C
+            elif file.type == FileType.TEXT_DOCUMENT:
+                print(f"Text file: {file}", file=sys.stderr)
+                continue
+            else:
+                warnings.warn(f"Unsupported file type: {file.type} for {file}")
+                if file.rte_flag and file.filename.endswith(".c"):
+                    lang = CMake.Language.C
+                elif file.rte_flag and file.filename.endswith(".s"):
+                    lang = CMake.Language.ASM
+                else:
+                    continue
+            cmake.add_source_files(file.path, lang, comment)
+            comment = None
 
     print(cmake)
 
