@@ -1,8 +1,11 @@
 import enum
+import operator
 import os
+import sys
 import warnings
-from dataclasses import dataclass, field
-from typing import List, Any, Optional, Dict, Iterable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Union, Iterable, Collection, Set, Tuple, Callable
 
 from lxml import etree
 
@@ -13,7 +16,26 @@ fp_proj = r"<machine local, not commited>\twi_scanner_pca10056.uvprojx"
 
 UnknownInt = int
 UnknownBool = bool
-TODOType = Any
+
+
+@enum.unique
+class FileType(enum.Enum):
+    C_SOURCE = 1
+    """C Source file"""
+    ASM_SOURCE = 2
+    """Assembly language file"""
+    OBJECT = 3
+    """Object file"""
+    LIBRARY = 4
+    """Library file"""
+    TEXT_DOCUMENT = 5
+    """Text Document file"""
+    CUSTOM = 7
+    """Custom file"""
+    CPP_SOURCE = 8
+    """C++ Source file"""
+    IMAGE = 9
+    """Image file"""
 
 
 # region XML data structures for Project File
@@ -101,7 +123,7 @@ class Target:
     @dataclass
     class File:
         name: str
-        type: int
+        type: FileType
         path: str
 
     @dataclass
@@ -181,8 +203,9 @@ class File:
     """Number of the :cls:`Group` this file belongs to."""
     number: int
     """Number of the file (global across all groups)."""
-    type: UnknownInt
-    expanded: UnknownBool
+    type: FileType
+    """File type as selected in the Options for File ... -> Properties dialog"""
+    expanded: bool
     """Whether the file is expanded (include file dependencies shown) in the Project Window file browser."""
     tv_exp_opt_dlg: UnknownBool
     dave2: UnknownBool
@@ -383,7 +406,7 @@ class UVisionProject:
                         files=[
                             Target.File(
                                 name=text(file, "FileName"),
-                                type=int(text(file, "FileType")),
+                                type=FileType(int(text(file, "FileType"))),
                                 path=text(file, "FilePath")
                             ) for file in group.xpath("Files/File")
                         ]
@@ -496,7 +519,7 @@ class UVisionProject:
                     File(
                         group_number=int(text(file, "GroupNumber")),
                         number=int(text(file, "FileNumber")),
-                        type=int(text(file, "FileType")),
+                        type=FileType(int(text(file, "FileType"))),
                         expanded=strict_bool(file, "tvExp"),
                         tv_exp_opt_dlg=strict_bool(file, "tvExpOptDlg"),
                         dave2=strict_bool(file, "bDave2"),
@@ -527,7 +550,7 @@ class UVisionProject:
             group.files.append(File(
                 group_number=group_number,
                 number=max(f.number for g in groups for f in g.files) + 1,
-                type=0,  # TODO
+                type=None,
                 expanded=False,
                 tv_exp_opt_dlg=False,  # TODO
                 dave2=False,  # TODO
