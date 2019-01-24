@@ -3,17 +3,17 @@ import operator
 import os
 import sys
 import warnings
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Union, Iterable, Collection, Set, Tuple, Callable
+from typing import List, Optional, Union, Iterable, Collection, Set, Tuple, Callable, Dict
 
 from lxml import etree
 
 __author__ = "Bojan Potočnik"
 
-fp_cmake = r"G:\Git\Dia-Vit\fw-spectrometer-logger\CMakeLists.txt"
-# fp_proj = r"D:\SDK\nRF5_SDK_15.2.0_9412b96\examples\peripheral\twi_scanner\pca10056\blank\arm5_no_packs\twi_scanner_pca10056.uvoptx"
-fp_proj = r"G:\Git\Dia-Vit\fw-spectrometer-logger\spectral_data_logger.uvprojx"
+fp_cmake = r"<machine local, not commited>\CMakeLists.txt"
+fp_proj = r"<machine local, not commited>\example_project.uvprojx"
 
 UnknownInt = int
 UnknownBool = bool
@@ -745,7 +745,10 @@ def main() -> None:
 
     for group in uvpf.groups:
         comment = group.name
-        # TODO: Add one comment for every file type as they are in the separate sections
+        if group.rte_flag:
+            comment = "RTE" + comment
+        # Add one comment for every file type as they are in the separate sections
+        files: Dict[CMake.Language, List[File]] = defaultdict(list)
         for file in group.files:
             if file.type == FileType.ASM_SOURCE:
                 lang = CMake.Language.ASM
@@ -755,15 +758,20 @@ def main() -> None:
                 print(f"Text file: {file}", file=sys.stderr)
                 continue
             else:
-                warnings.warn(f"Unsupported file type: {file.type} for {file}")
                 if file.rte_flag and file.filename.endswith(".c"):
                     lang = CMake.Language.C
                 elif file.rte_flag and file.filename.endswith(".s"):
                     lang = CMake.Language.ASM
                 else:
+                    warnings.warn(f"Unsupported file type: {file.type} for {file}")
                     continue
-            cmake.add_source_files(file.path, lang, comment)
-            comment = None
+            files[lang].append(file)
+
+        for lang, files in files.items():
+            comment_per_type = comment
+            for file in files:
+                cmake.add_source_files(file.path, lang, comment_per_type)
+                comment_per_type = None
 
     print(cmake)
 
