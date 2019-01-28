@@ -1,19 +1,31 @@
+"""
+Usage:
+    main.py [<project>]
+
+Options:
+    <project>   Path to the .uvprojx file (Keil® µVision5 Project File).
+                The .uvoptx file (Keil® µVision5 Project Options file) will
+                be located automatically as it shall be adjacent to the
+                .uvprojx file, having the same filename.
+                If this is a directory, .uvprojx is found automatically (if
+                multiple found then the latest changed is chosen).
+                If not provided then the current working directory is chosen
+                as a project directory.
+"""
 import enum
 import operator
 import os
-import sys
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass
+from os import DirEntry
 from pathlib import Path
-from typing import List, Optional, Union, Iterable, Collection, Set, Tuple, Callable, Dict
+from typing import List, Optional, Union, Iterable, Collection, Set, Tuple, Callable, Dict, Iterator
 
+from docopt import docopt
 from lxml import etree
 
 __author__ = "Bojan Potočnik"
-
-fp_cmake = r"<machine local, not commited>\CMakeLists.txt"
-fp_proj = r"<machine local, not commited>\example_project.uvprojx"
 
 UnknownInt = int
 UnknownBool = bool
@@ -280,6 +292,9 @@ def strict_hex(element: etree.ElementBase, name: str) -> int:
 
 @dataclass
 class UVisionProject:
+    project_file_path: str
+    project_options_path: str
+
     # region Project File
     targets: List[Target]
     # endregion Project File
@@ -293,12 +308,14 @@ class UVisionProject:
     @classmethod
     def new(cls, project_file_path: str) -> 'UVisionProject':
         fp_base = os.path.splitext(project_file_path)[0]
+        project_file_path = fp_base + ".uvprojx"
+        project_options_path = fp_base + ".uvoptx"
 
-        with open(fp_base + ".uvprojx") as f:
+        with open(project_file_path) as f:
             # noinspection PyProtectedMember
             xproj: etree._Element = etree.parse(f).getroot()
 
-        with open(fp_base + ".uvoptx") as f:
+        with open(project_options_path) as f:
             # noinspection PyProtectedMember
             xopt: etree._Element = etree.parse(f).getroot()
 
@@ -562,6 +579,8 @@ class UVisionProject:
             ))
 
         return cls(
+            project_file_path=project_file_path,
+            project_options_path=project_options_path,
             targets=targets,
             groups=groups
         )
@@ -596,6 +615,7 @@ class CMake:
         self.defines: List[CMake.String] = []
         self.undefines: List[CMake.String] = []
         self.source_file_paths: List[CMake.String] = []
+        self.other_file_paths: List[CMake.String] = []
 
     @classmethod
     def _get(cls, lst: List[String], obj: str) -> String:
@@ -611,7 +631,7 @@ class CMake:
 
     @classmethod
     def _add_values(cls, where: List[String], values: Union[str, Iterable[str]],
-                    languages: Union[Language, Collection[Language]], comment: Optional[str] = None) -> None:
+                    languages: Union[Language, Collection[Language], None], comment: Optional[str] = None) -> None:
         if isinstance(languages, CMake.Language):
             languages = [languages]
 
@@ -621,13 +641,18 @@ class CMake:
                 # Add comment to the first value only
                 obj.comment = comment
                 comment = None
-            obj.languages.update(languages)
+            if languages:
+                obj.languages.update(languages)
+
+    @staticmethod
+    def _clean_paths(paths: Union[str, Iterable[str]]) -> List[str]:
+        if isinstance(paths, (str, Path)):
+            paths = [paths]
+        return [Path(p).as_posix() for p in map(os.path.normpath, paths)]
 
     def add_include_paths(self, paths: Union[str, Iterable[str]], languages: Union[Language, Collection[Language]],
                           comment: str = None) -> None:
-        if isinstance(paths, (str, Path)):
-            paths = [paths]
-        self._add_values(self.include_paths, paths, languages, comment)
+        self._add_values(self.include_paths, self._clean_paths(paths), languages, comment)
 
     def add_defines(self, defines: Union[str, Iterable[str]], languages: Union[Language, Collection[Language]],
                     comment: str = None) -> None:
@@ -637,13 +662,15 @@ class CMake:
                       comment: str = None) -> None:
         self._add_values(self.undefines, undefines, languages, comment)
 
-    def add_source_files(self, paths: Union[str, Iterable[str]], languages: Union[Language, Collection[Language]],
+    def add_source_files(self, paths: Union[str, Iterable[str]], languages: Union[Language, Collection[Language], None],
                          comment: str = None) -> None:
-        if isinstance(paths, (str, Path)):
-            paths = [paths]
-        self._add_values(self.source_file_paths, paths, languages, comment)
+        self._add_values(self.source_file_paths if languages else self.other_file_paths,
+                         self._clean_paths(paths), languages, comment)
 
-    def _check_common(self) -> Set[Language]:
+    def add_other_files(self, paths: Union[str, Iterable[str]], comment: str = None) -> None:
+        self.add_source_files(paths, None, comment)
+
+    def check_common(self) -> Set[Language]:
         """
         Check which properties are common to all language configurations.
 
@@ -664,7 +691,7 @@ class CMake:
         return languages
 
     def __str__(self) -> str:
-        languages = sorted(self._check_common(), key=operator.attrgetter('value'))
+        languages = sorted(self.check_common(), key=operator.attrgetter('value'))
 
         ret_str = []
 
@@ -684,18 +711,30 @@ class CMake:
               for lang in languages)
         ]
 
+        def _add_section_files(comment: str, var_name: str, value_iterator: Iterable[CMake.String]) -> str:
+            s = (f"# {comment}\n"
+                 f"set({var_name}")
+            for value in value_iterator:
+                if value.comment is not None:
+                    s += f"\n\t# {value.comment}"
+                s += f"\n\t{value.value}"
+            return s + "\n)"
+
         for section_comment, section_var_prefix, section_props in prop_sets:
             ss_str = []
-            for comment, var_suffix, filter_fun in sub_prop_sets:
-                s = (f"# {comment} {section_comment}\n"
-                     f"set({section_var_prefix}_{var_suffix}")
-                for ip in filter(filter_fun, section_props):
-                    if ip.comment is not None:
-                        s += f"\n\t# {ip.comment}"
-                    s += f"\n\t{ip.value}"
-                s += "\n)"
-                ss_str.append(s)
+            for prop_set_comment, var_suffix, filter_fun in sub_prop_sets:
+                ss_str.append(_add_section_files(
+                    comment=f"{prop_set_comment} {section_comment}",
+                    var_name=f"{section_var_prefix}_{var_suffix}",
+                    value_iterator=filter(filter_fun, section_props),
+                ))
             ret_str.append("\n\n".join(ss_str))
+
+        ret_str.append(_add_section_files(
+            comment="Other files",
+            var_name="OTHER_FILES",
+            value_iterator=self.other_file_paths
+        ))
 
         # for lang, lc in self.language_configs.items():
         #     s = (f"# {lang.value} include directories\n"
@@ -710,61 +749,67 @@ class CMake:
 
 
 def main() -> None:
-    uvpf = UVisionProject.new(fp_proj)
+    # region Parse arguments
+    arguments = docopt(__doc__)
+    project_path: str = arguments["<project>"] or "."
 
-    # print("ASM Includes:")
-    # print("".join(f"\t{path}\n" for path in uvpf.targets[0].build.asm.include_paths))
-    #
-    # print("C Includes:")
-    # print("".join(f"\t{path}\n" for path in uvpf.targets[0].build.c.include_paths))
+    if not os.path.isfile(project_path):
+        with os.scandir(project_path) as dirs:  # type: Iterator[DirEntry]
+            projects = [de.path for de in dirs if (de.is_file() and (os.path.splitext(de.name)[1] == ".uvprojx"))]
 
-    print()
+        if not projects:
+            raise FileNotFoundError(f"Could not find any .uvprojx file in '{project_path}'")
+        elif len(projects) > 1:
+            # Choose the latest file by modification time.
+            project_path = max(projects, key=os.path.getmtime)
+        else:
+            project_path = projects[0]
+    project_path = os.path.realpath(project_path)
+    # endregion Parse arguments
 
-    # for group in uvpf.targets[0].groups:
-    #     for file in group.files:
-    #         if "ads1x1x" not in file.name:
-    #             continue
-    #         print(file)
-    #
-    # for group in uvpf.groups:
-    #     for file in group.files:
-    #         if "ads1x1x" not in file.filename:
-    #             continue
-    #         print(file)
+    print(f"Using µVision5 Project File '{project_path}'")
 
+    # Parse uVision project XML files
+    uvp = UVisionProject.new(project_path)
+
+    # Generate CMake file and populate it with information from uVision project
     cmake = CMake()
 
-    cmake.add_include_paths(uvpf.targets[0].build.asm.include_paths, CMake.Language.ASM)
-    cmake.add_defines(uvpf.targets[0].build.asm.defines, CMake.Language.ASM)
-    cmake.add_undefines(uvpf.targets[0].build.asm.undefines, CMake.Language.ASM)
-    # cmake.add_undefines(uvpf.targets[0].groups, CMake.Language.ASM)
+    cmake.add_include_paths(uvp.targets[0].build.asm.include_paths, CMake.Language.ASM)
+    cmake.add_defines(uvp.targets[0].build.asm.defines, CMake.Language.ASM)
+    cmake.add_undefines(uvp.targets[0].build.asm.undefines, CMake.Language.ASM)
 
-    cmake.add_include_paths(uvpf.targets[0].build.c.include_paths, CMake.Language.C)
-    cmake.add_defines(uvpf.targets[0].build.c.defines, CMake.Language.C)
-    cmake.add_undefines(uvpf.targets[0].build.c.undefines, CMake.Language.C)
+    cmake.add_include_paths(uvp.targets[0].build.c.include_paths, CMake.Language.C)
+    cmake.add_defines(uvp.targets[0].build.c.defines, CMake.Language.C)
+    cmake.add_undefines(uvp.targets[0].build.c.undefines, CMake.Language.C)
 
-    for group in uvpf.groups:
+    for group in uvp.groups:
         comment = group.name
         if group.rte_flag:
+            # RTE groups start with double colon (::).
             comment = "RTE" + comment
         # Add one comment for every file type as they are in the separate sections
-        files: Dict[CMake.Language, List[File]] = defaultdict(list)
+        files: Dict[Union[CMake.Language, None], List[File]] = defaultdict(list)
         for file in group.files:
             if file.type == FileType.ASM_SOURCE:
                 lang = CMake.Language.ASM
             elif file.type == FileType.C_SOURCE:
                 lang = CMake.Language.C
             elif file.type == FileType.TEXT_DOCUMENT:
-                print(f"Text file: {file}", file=sys.stderr)
-                continue
-            else:
-                if file.rte_flag and file.filename.endswith(".c"):
-                    lang = CMake.Language.C
-                elif file.rte_flag and file.filename.endswith(".s"):
+                lang = None
+            elif (file.type is None) and file.rte_flag:
+                if file.filename.endswith(".s"):
                     lang = CMake.Language.ASM
+                elif file.filename.endswith(".c"):
+                    lang = CMake.Language.C
+                elif file.filename.endswith(".cpp"):
+                    lang = CMake.Language.CPP
                 else:
-                    warnings.warn(f"Unsupported file type: {file.type} for {file}")
+                    warnings.warn(f"Unknown RTE file {file}")
                     continue
+            else:
+                warnings.warn(f"Unsupported file type: {file.type} for {file}")
+                continue
             files[lang].append(file)
 
         for lang, files in files.items():
@@ -773,7 +818,11 @@ def main() -> None:
                 cmake.add_source_files(file.path, lang, comment_per_type)
                 comment_per_type = None
 
-    print(cmake)
+    fp_proj_cmake = os.path.join(os.path.dirname(uvp.project_file_path),
+                                 os.path.splitext(os.path.basename(uvp.project_file_path))[0] + ".cmake")
+    with open(fp_proj_cmake, 'w') as f:
+        print(cmake, file=f)
+    print(f"Generated CMake file '{fp_proj_cmake}'")
 
 
 if __name__ == "__main__":
