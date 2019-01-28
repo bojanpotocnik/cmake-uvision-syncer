@@ -32,6 +32,13 @@ UnknownBool = bool
 
 
 @enum.unique
+class Language(enum.Enum):
+    ASM = "Assembler"
+    C = "C"
+    CPP = "C++"
+
+
+@enum.unique
 class FileType(enum.Enum):
     C_SOURCE = 1
     """C Source file"""
@@ -271,8 +278,8 @@ def text(element: etree.ElementBase, name: str, is_attribute: bool = False, null
     return value[0].text
 
 
-def strict_bool(element: etree.ElementBase, name: str) -> bool:
-    value = text(element, name)
+def strict_bool(element: etree.ElementBase, name: str, nullable: bool = False) -> bool:
+    value = text(element, name, nullable=nullable)
     if value == "0":
         return False
     if value == "1":
@@ -332,7 +339,7 @@ class UVisionProject:
                     name=text(target, "ToolsetName")
                 ),
                 compiler=Target.Compiler(
-                    cc=text(target, "pCCUsed"),
+                    cc=text(target, "pCCUsed", nullable=True),
                     ac6=strict_bool(target, "uAC6")
                 ),
                 options=next(
@@ -585,19 +592,55 @@ class UVisionProject:
             groups=groups
         )
 
+    def source_files(self) -> Iterator[Tuple[File, Optional[Language], Optional[str]]]:
+        """
+        Get all files grouped by the file type with group names as a comments.
+        """
+        # Add source files
+        for group in self.groups:
+            comment = group.name
+            if group.rte_flag:
+                # RTE groups start with double colon (::).
+                comment = "RTE" + comment
+
+            # Group files by type and add one comment for every file type as they are in the separate sections.
+            files: Dict[Union[Language, None], List[File]] = defaultdict(list)
+
+            for file in group.files:
+                if file.type == FileType.ASM_SOURCE:
+                    lang = Language.ASM
+                elif file.type == FileType.C_SOURCE:
+                    lang = Language.C
+                elif file.type == FileType.TEXT_DOCUMENT:
+                    lang = None
+                elif (file.type is None) and file.rte_flag:
+                    if file.filename.endswith(".s"):
+                        lang = Language.ASM
+                    elif file.filename.endswith(".c"):
+                        lang = Language.C
+                    elif file.filename.endswith(".cpp"):
+                        lang = Language.CPP
+                    else:
+                        warnings.warn(f"Unknown RTE file {file}")
+                        continue
+                else:
+                    warnings.warn(f"Unsupported file type: {file.type} for {file}")
+                    continue
+                files[lang].append(file)
+
+            for lang, files in files.items():
+                comment_per_type = comment
+                for file in files:
+                    yield file, lang, comment_per_type
+                    comment_per_type = None
+
 
 class CMake:
-    @enum.unique
-    class Language(enum.Enum):
-        ASM = "Assembler"
-        C = "C"
-        CPP = "C++"
-
     @dataclass
     class String:
         value: str
         """The actual string value."""
-        languages: Set['CMake.Language']
+        languages: Set[Language]
         """Set of all build configs in which this value is present."""
         common: bool = False
         comment: Optional[str] = None
@@ -632,7 +675,7 @@ class CMake:
     @classmethod
     def _add_values(cls, where: List[String], values: Union[str, Iterable[str]],
                     languages: Union[Language, Collection[Language], None], comment: Optional[str] = None) -> None:
-        if isinstance(languages, CMake.Language):
+        if isinstance(languages, Language):
             languages = [languages]
 
         for val in values:
@@ -693,14 +736,17 @@ class CMake:
     def __str__(self) -> str:
         languages = sorted(self.check_common(), key=operator.attrgetter('value'))
 
-        ret_str = []
+        ret_str = [
+            "# Made with CMake <> uVision project file synchronizer"
+            "# https://github.com/bojanpotocnik/cmake-uvision-syncer"
+        ]
 
         # Set of the build properties
-        prop_sets: List[Tuple[str, str, List[CMake.String]]] = [
-            ("include directories", "INCLUDE_DIRS", self.include_paths),
-            ("definitions", "DEFINES", self.defines),
-            ("un-defines", "UNDEFINES", self.undefines),
-            ("source files", "SOURCES", self.source_file_paths),
+        prop_sets: List[Tuple[str, str, List[CMake.String], str]] = [
+            ("definitions", "DEFINES", self.defines, "-D"),
+            ("un-defines", "UNDEFINES", self.undefines, ""),
+            ("include directories", "INCLUDE_DIRS", self.include_paths, ""),
+            ("source files", "SOURCES", self.source_file_paths, ""),
         ]
 
         # Set of the language configs per build property
@@ -711,22 +757,24 @@ class CMake:
               for lang in languages)
         ]
 
-        def _add_section_files(comment: str, var_name: str, value_iterator: Iterable[CMake.String]) -> str:
+        def _add_section_files(comment: str, var_name: str, value_iterator: Iterable[CMake.String],
+                               value_prefix: str = "") -> str:
             s = (f"# {comment}\n"
                  f"set({var_name}")
             for value in value_iterator:
                 if value.comment is not None:
                     s += f"\n\t# {value.comment}"
-                s += f"\n\t{value.value}"
+                s += f"\n\t{value_prefix}{value.value}"
             return s + "\n)"
 
-        for section_comment, section_var_prefix, section_props in prop_sets:
+        for section_comment, section_var_prefix, section_props, val_prefix in prop_sets:
             ss_str = []
             for prop_set_comment, var_suffix, filter_fun in sub_prop_sets:
                 ss_str.append(_add_section_files(
                     comment=f"{prop_set_comment} {section_comment}",
                     var_name=f"{section_var_prefix}_{var_suffix}",
                     value_iterator=filter(filter_fun, section_props),
+                    value_prefix=val_prefix
                 ))
             ret_str.append("\n\n".join(ss_str))
 
@@ -735,15 +783,6 @@ class CMake:
             var_name="OTHER_FILES",
             value_iterator=self.other_file_paths
         ))
-
-        # for lang, lc in self.language_configs.items():
-        #     s = (f"# {lang.value} include directories\n"
-        #          f"set(INCLUDE_DIRS_{lang.name}"
-        #          )
-        #     for ip in lc.include_paths:
-        #         s += f"\n\t{ip}"
-        #     s += "\n)"
-        #     lc_str.append(s)
 
         return "\n\n\n".join(ret_str)
 
@@ -775,48 +814,19 @@ def main() -> None:
     # Generate CMake file and populate it with information from uVision project
     cmake = CMake()
 
-    cmake.add_include_paths(uvp.targets[0].build.asm.include_paths, CMake.Language.ASM)
-    cmake.add_defines(uvp.targets[0].build.asm.defines, CMake.Language.ASM)
-    cmake.add_undefines(uvp.targets[0].build.asm.undefines, CMake.Language.ASM)
+    # Add Assembler properties
+    cmake.add_include_paths(uvp.targets[0].build.asm.include_paths, Language.ASM)
+    cmake.add_defines(uvp.targets[0].build.asm.defines, Language.ASM)
+    cmake.add_undefines(uvp.targets[0].build.asm.undefines, Language.ASM)
 
-    cmake.add_include_paths(uvp.targets[0].build.c.include_paths, CMake.Language.C)
-    cmake.add_defines(uvp.targets[0].build.c.defines, CMake.Language.C)
-    cmake.add_undefines(uvp.targets[0].build.c.undefines, CMake.Language.C)
+    # Add C properties
+    cmake.add_include_paths(uvp.targets[0].build.c.include_paths, Language.C)
+    cmake.add_defines(uvp.targets[0].build.c.defines, Language.C)
+    cmake.add_undefines(uvp.targets[0].build.c.undefines, Language.C)
 
-    for group in uvp.groups:
-        comment = group.name
-        if group.rte_flag:
-            # RTE groups start with double colon (::).
-            comment = "RTE" + comment
-        # Add one comment for every file type as they are in the separate sections
-        files: Dict[Union[CMake.Language, None], List[File]] = defaultdict(list)
-        for file in group.files:
-            if file.type == FileType.ASM_SOURCE:
-                lang = CMake.Language.ASM
-            elif file.type == FileType.C_SOURCE:
-                lang = CMake.Language.C
-            elif file.type == FileType.TEXT_DOCUMENT:
-                lang = None
-            elif (file.type is None) and file.rte_flag:
-                if file.filename.endswith(".s"):
-                    lang = CMake.Language.ASM
-                elif file.filename.endswith(".c"):
-                    lang = CMake.Language.C
-                elif file.filename.endswith(".cpp"):
-                    lang = CMake.Language.CPP
-                else:
-                    warnings.warn(f"Unknown RTE file {file}")
-                    continue
-            else:
-                warnings.warn(f"Unsupported file type: {file.type} for {file}")
-                continue
-            files[lang].append(file)
-
-        for lang, files in files.items():
-            comment_per_type = comment
-            for file in files:
-                cmake.add_source_files(file.path, lang, comment_per_type)
-                comment_per_type = None
+    # Add source and other files
+    for file, lang, comment in uvp.source_files():
+        cmake.add_source_files(file.path, lang, comment)
 
     fp_proj_cmake = os.path.join(os.path.dirname(uvp.project_file_path),
                                  os.path.splitext(os.path.basename(uvp.project_file_path))[0] + ".cmake")
