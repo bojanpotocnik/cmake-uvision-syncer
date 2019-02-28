@@ -145,6 +145,10 @@ class Target:
         name: str
         type: FileType
         path: str
+        include_in_build: bool
+        """Whether this file is included in the build or ignored."""
+        always_build: bool
+        """Whether to always build this file."""
 
     @dataclass
     class Group:
@@ -227,6 +231,10 @@ class File:
     """File type as selected in the Options for File ... -> Properties dialog"""
     expanded: bool
     """Whether the file is expanded (include file dependencies shown) in the Project Window file browser."""
+    include_in_build: bool
+    """Whether this file is included in the build or ignored."""
+    always_build: bool
+    """Whether to always build this file."""
     tv_exp_opt_dlg: UnknownBool
     dave2: UnknownBool
     path: str
@@ -278,12 +286,15 @@ def text(element: etree.ElementBase, name: str, is_attribute: bool = False, null
     return value[0].text
 
 
-def strict_bool(element: etree.ElementBase, name: str, nullable: bool = False) -> bool:
+def strict_bool(element: etree.ElementBase, name: str, nullable: bool = False, *,
+                false_value: str = "0", true_value: str = "1") -> Optional[bool]:
     value = text(element, name, nullable=nullable)
-    if value == "0":
+    if value == false_value:
         return False
-    if value == "1":
+    if value == true_value:
         return True
+    if (value is None) and nullable:
+        return None
     raise ValueError(f"'{value}' (of {name}) is not valid boolean value")
 
 
@@ -432,7 +443,11 @@ class UVisionProject:
                             Target.File(
                                 name=text(file, "FileName"),
                                 type=FileType(int(text(file, "FileType"))),
-                                path=text(file, "FilePath")
+                                path=text(file, "FilePath"),
+                                include_in_build=strict_bool(file, "FileOption/CommonProperty/IncludeInBuild",
+                                                             nullable=True),
+                                always_build=strict_bool(file, "FileOption/CommonProperty/AlwaysBuild",
+                                                         nullable=True, true_value="2")
                             ) for file in group.xpath("Files/File")
                         ]
                     ) for group in target.xpath("Groups/Group")
@@ -452,7 +467,9 @@ class UVisionProject:
                     target_infos=[
                         RTE.TargetInfo(
                             name=text(ti, "name", True),
-                            version_match_mode=RTE.TargetInfo.VersionMatchMode(text(ti, "versionMatchMode", True))
+                            # Using generator and list only for local variable
+                            version_match_mode=next(RTE.TargetInfo.VersionMatchMode(vmm) if vmm else None
+                                                    for vmm in [text(ti, "versionMatchMode", True, True)])
                         ) for ti in package.xpath("targetInfos/targetInfo")
                     ]
                 ) for package in xproj.xpath("RTE/packages/package")
@@ -533,29 +550,43 @@ class UVisionProject:
         if xopt.tag != "ProjectOpt":
             raise ValueError("Invalid uVision Project Options XML file")
 
-        groups: List[Group] = [
-            Group(
-                name=text(group, "GroupName"),
+        groups: List[Group] = []
+        for group in xopt.xpath("Group"):
+            group_name = text(group, "GroupName")
+            # Find this group in the Project File
+            xproj_group = next(g for g in next(iter(targets)).groups if (g.name == group_name))
+
+            # Find all files in this group and also in the Project File
+            files: List[File] = []
+            for file in group.xpath("File"):
+                file_type = FileType(int(text(file, "FileType")))
+                file_name = text(file, "FilenameWithoutPath")
+
+                xproj_file = next(f for f in xproj_group.files if (f.type == file_type and f.name == file_name))
+
+                files.append(File(
+                    group_number=int(text(file, "GroupNumber")),
+                    number=int(text(file, "FileNumber")),
+                    type=file_type,
+                    expanded=strict_bool(file, "tvExp"),
+                    include_in_build=xproj_file.include_in_build,
+                    always_build=xproj_file.always_build,
+                    tv_exp_opt_dlg=strict_bool(file, "tvExpOptDlg"),
+                    dave2=strict_bool(file, "bDave2"),
+                    path=text(file, "PathWithFileName"),
+                    filename=file_name,
+                    rte_flag=strict_bool(file, "RteFlg"),
+                    shared=strict_bool(file, "bShared")
+                ))
+
+            groups.append(Group(
+                name=group_name,
                 expanded=strict_bool(group, "tvExp"),
                 tv_exp_opt_dlg=strict_bool(group, "tvExpOptDlg"),
                 cb_sel=strict_bool(group, "cbSel"),
                 rte_flag=strict_bool(group, "RteFlg"),
-                files=[
-                    File(
-                        group_number=int(text(file, "GroupNumber")),
-                        number=int(text(file, "FileNumber")),
-                        type=FileType(int(text(file, "FileType"))),
-                        expanded=strict_bool(file, "tvExp"),
-                        tv_exp_opt_dlg=strict_bool(file, "tvExpOptDlg"),
-                        dave2=strict_bool(file, "bDave2"),
-                        path=text(file, "PathWithFileName"),
-                        filename=text(file, "FilenameWithoutPath"),
-                        rte_flag=strict_bool(file, "RteFlg"),
-                        shared=strict_bool(file, "bShared")
-                    ) for file in group.xpath("File")
-                ]
-            ) for group in xopt.xpath("Group")
-        ]
+                files=files
+            ))
 
         # There is no more *currently relevant* data in the Project Options file.
 
@@ -572,11 +603,26 @@ class UVisionProject:
                                   f" (expected to be {group_number})")
                 if group.rte_flag and group.name.strip(":") == file.component.class_:
                     break
+            filename = os.path.basename(file.instance)
+            # Detect file type (this information is not provided for RTE files)
+            if filename.endswith(".s"):
+                file_type = FileType.ASM_SOURCE
+            elif filename.endswith(".c"):
+                file_type = FileType.C_SOURCE
+            elif filename.endswith(".cpp"):
+                file_type = FileType.CPP_SOURCE
+            elif filename.endswith(".h"):
+                file_type = FileType.TEXT_DOCUMENT
+            else:
+                warnings.warn(f"Unknown RTE file type '{file.instance}': {file}")
+                continue
             group.files.append(File(
                 group_number=group_number,
                 number=max(f.number for g in groups for f in g.files) + 1,
-                type=None,
+                type=file_type,
                 expanded=False,
+                include_in_build=True,  # TODO: This information is available for RTE files
+                always_build=None,
                 tv_exp_opt_dlg=False,  # TODO
                 dave2=False,  # TODO
                 path=file.instance,
@@ -613,16 +659,6 @@ class UVisionProject:
                     lang = Language.C
                 elif file.type == FileType.TEXT_DOCUMENT:
                     lang = None
-                elif (file.type is None) and file.rte_flag:
-                    if file.filename.endswith(".s"):
-                        lang = Language.ASM
-                    elif file.filename.endswith(".c"):
-                        lang = Language.C
-                    elif file.filename.endswith(".cpp"):
-                        lang = Language.CPP
-                    else:
-                        warnings.warn(f"Unknown RTE file {file}")
-                        continue
                 else:
                     warnings.warn(f"Unsupported file type: {file.type} for {file}")
                     continue
@@ -705,10 +741,14 @@ class CMake:
                       comment: str = None) -> None:
         self._add_values(self.undefines, undefines, languages, comment)
 
-    def add_source_files(self, paths: Union[str, Iterable[str]], languages: Union[Language, Collection[Language], None],
-                         comment: str = None) -> None:
-        self._add_values(self.source_file_paths if languages else self.other_file_paths,
-                         self._clean_paths(paths), languages, comment)
+    def add_source_files(self, paths: Union[None, str, Iterable[str]],
+                         languages: Union[Language, Collection[Language], None],
+                         comment: str = None, include_in_build: bool = True) -> None:
+        paths = self._clean_paths(paths)
+        # If file is not included in the build, comment it
+        if include_in_build is False:
+            paths = ["# " + path for path in paths]
+        self._add_values(self.source_file_paths if languages else self.other_file_paths, paths, languages, comment)
 
     def add_other_files(self, paths: Union[str, Iterable[str]], comment: str = None) -> None:
         self.add_source_files(paths, None, comment)
@@ -826,7 +866,7 @@ def main() -> None:
 
     # Add source and other files
     for file, lang, comment in uvp.source_files():
-        cmake.add_source_files(file.path, lang, comment)
+        cmake.add_source_files(file.path, lang, comment, file.include_in_build)
 
     fp_proj_cmake = os.path.join(os.path.dirname(uvp.project_file_path),
                                  os.path.splitext(os.path.basename(uvp.project_file_path))[0] + ".cmake")
